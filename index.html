@@ -78,7 +78,7 @@
     line-height: 1.5;
   }
 
-  .app { max-width: 1100px; margin: 0 auto; padding: 32px 20px 80px; }
+  .app { max-width: 1400px; margin: 0 auto; padding: 32px 20px 80px; }
 
   header.top { position: relative; display: flex; flex-direction: column; gap: 18px; margin-bottom: 28px; }
   .logout-top { position: absolute; top: 0; right: 0; }
@@ -141,6 +141,9 @@
   .panel p.hint { color: var(--text-muted); font-size: 13px; margin: 0 0 14px; }
 
   .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+  .cupo { background: var(--pending-tint); color: var(--pending); border-radius: 12px; padding: 10px 16px; font-size: 13px; font-weight: 600; text-align: center; margin-bottom: 20px; }
+  .cupo strong { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .cupo.agotado { background: var(--danger-tint); color: var(--danger); }
   .count { font-size: 13px; color: var(--text-muted); }
   .count strong { color: var(--text); font-variant-numeric: tabular-nums; }
   .count .bad { color: var(--danger); }
@@ -160,7 +163,9 @@
   th { background: var(--surface-sunken); font-weight: 600; font-size: 12px; color: var(--text-muted); position: sticky; top: 0; }
   tr:last-child td { border-bottom: none; }
   td.num, td.cuit { white-space: nowrap; font-variant-numeric: tabular-nums; }
-  td.act { min-width: 320px; color: var(--text-muted); }
+  td.act1 { min-width: 220px; }
+  td.act { min-width: 300px; color: var(--text-muted); }
+  td.dom { min-width: 220px; }
   td.act span { display: block; }
   tr.err td.razon { color: var(--danger); }
   .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
@@ -168,6 +173,7 @@
   .tag.mono { background: var(--ok-tint); color: var(--ok); }
   .tag.ex { background: var(--pending-tint); color: var(--pending); }
   .tag.no { background: var(--surface-sunken); color: var(--text-muted); }
+  footer.note { margin-top: 34px; color: var(--text-muted); font-size: 12.5px; text-align: center; }
   .empty { padding: 28px; text-align: center; color: var(--text-muted); font-size: 13px; }
 </style>
 </head>
@@ -196,6 +202,7 @@
 </div>
 
 <div class="app" id="appRoot" style="display:none;">
+  <div class="cupo" id="cupo">Podés pegar todos los CUITs juntos: se consultan automáticamente de a 20.</div>
   <div id="banner" class="banner" style="display:none;"></div>
   <header class="top">
     <button class="btn primary logout-top" id="logoutBtnTop">Cerrar sesión</button>
@@ -232,11 +239,13 @@
     <div class="stats" id="stats" style="display:none;"></div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>N°</th><th>CUIT</th><th>Razón social</th><th>Condición IVA</th><th>Actividad</th></tr></thead>
-        <tbody id="resultBody"><tr><td colspan="5" class="empty">Todavía no hay resultados.</td></tr></tbody>
+        <thead><tr><th>N°</th><th>CUIT</th><th>Razón social</th><th>Condición IVA</th><th>Actividad principal</th><th>Actividades secundarias</th><th>Domicilio fiscal</th></tr></thead>
+        <tbody id="resultBody"><tr><td colspan="7" class="empty">Todavía no hay resultados.</td></tr></tbody>
       </table>
     </div>
   </section>
+
+  <footer class="note">Estudio Contable Z&amp;V</footer>
 </div>
 
 <script>
@@ -283,15 +292,31 @@ const $ = id => document.getElementById(id);
 const input = $("cuitsInput");
 let resultados = [];
 let consultando = false;
+let cupo = null; // { limite, restantes } informado por el servidor
+
+function actualizarCupo(data) {
+  if (data && typeof data.restantes === "number") cupo = { limite: data.limite, restantes: data.restantes };
+  if (!cupo) return;
+  const el = $("cupo");
+  el.classList.toggle("agotado", cupo.restantes === 0);
+  el.innerHTML = cupo.restantes === 0
+    ? `Llegaste al límite diario de <strong>${cupo.limite}</strong> CUITs. Mañana se renueva.`
+    : `Podés pegar todos los CUITs juntos: se consultan automáticamente de a 20. ` +
+      `Límite diario: <strong>${cupo.limite}</strong> CUITs por usuario — hoy te quedan <strong>${cupo.restantes}</strong>.`;
+  actualizarContador();
+}
 
 function actualizarContador() {
   const lista = extraerCuits(input.value);
-  const invalidos = lista.filter(c => !cuitValido(c)).length;
+  const validos = lista.filter(cuitValido).length;
+  const invalidos = lista.length - validos;
+  const excede = cupo && validos > cupo.restantes;
   $("cuitsCount").innerHTML = lista.length
     ? `<strong>${lista.length}</strong> CUIT${lista.length === 1 ? "" : "s"} detectado${lista.length === 1 ? "" : "s"}` +
-      (invalidos ? ` · <span class="bad">${invalidos} con dígito verificador inválido</span>` : "")
+      (invalidos ? ` · <span class="bad">${invalidos} con dígito verificador inválido</span>` : "") +
+      (excede ? ` · <span class="bad">Superan los ${cupo.restantes} que te quedan hoy</span>` : "")
     : "";
-  $("consultarBtn").disabled = consultando || !lista.length;
+  $("consultarBtn").disabled = consultando || !lista.length || excede;
 }
 input.addEventListener("input", actualizarContador);
 $("limpiarBtn").addEventListener("click", () => { input.value = ""; actualizarContador(); input.focus(); });
@@ -329,6 +354,7 @@ $("consultarBtn").addEventListener("click", async () => {
       const data = await pedirAlServidor("/consultar", { cuits: lote.map(r => r.cuit) });
       data.resultados.forEach((res, k) => Object.assign(lote[k], res, { pendiente: false }));
       avisoVencimiento(data.certificadoVence);
+      actualizarCupo(data);
       hechos += lote.length;
       progreso(hechos, aConsultar.length);
       render();
@@ -374,13 +400,17 @@ function tagIva(iva) {
   const cls = { "Responsable Inscripto": "ri", "Monotributo": "mono", "IVA Exento": "ex" }[iva] || "no";
   return iva ? `<span class="tag ${cls}">${esc(iva)}</span>` : "";
 }
+// El servidor envía las actividades ordenadas según ARCA: la primera es la principal.
+function actividades(r) { return (r.actividad || "").split(" | ").filter(Boolean); }
+
 function render() {
   const body = $("resultBody");
-  if (!resultados.length) { body.innerHTML = `<tr><td colspan="5" class="empty">Todavía no hay resultados.</td></tr>`; $("stats").style.display = "none"; return; }
+  if (!resultados.length) { body.innerHTML = `<tr><td colspan="7" class="empty">Todavía no hay resultados.</td></tr>`; $("stats").style.display = "none"; return; }
   body.innerHTML = resultados.map((r, i) => {
     const razon = r.pendiente ? `<span style="color:var(--text-muted)">Consultando…</span>` : r.error ? "ERROR: " + esc(r.error) : esc(r.razon);
-    const acts = (r.actividad || "").split(" | ").filter(Boolean).map(a => `<span>${esc(a)}</span>`).join("");
-    return `<tr class="${r.error ? "err" : ""}"><td class="num">${i + 1}</td><td class="cuit">${formatoCuit(r.cuit)}</td><td class="razon">${razon}</td><td>${tagIva(r.iva)}</td><td class="act">${acts}</td></tr>`;
+    const [principal, ...secundarias] = actividades(r);
+    const acts = secundarias.map(a => `<span>${esc(a)}</span>`).join("");
+    return `<tr class="${r.error ? "err" : ""}"><td class="num">${i + 1}</td><td class="cuit">${formatoCuit(r.cuit)}</td><td class="razon">${razon}</td><td>${tagIva(r.iva)}</td><td class="act1">${esc(principal || "")}</td><td class="act">${acts}</td><td class="dom">${esc(r.domicilio)}</td></tr>`;
   }).join("");
   const cuenta = f => resultados.filter(f).length;
   const errores = cuenta(r => r.error);
@@ -402,22 +432,23 @@ function celdaTexto(ref, v, s) {
   return `<c r="${ref}" t="inlineStr"${s ? ` s="${s}"` : ""}><is><t xml:space="preserve">${xmlEsc(v)}</t></is></c>`;
 }
 function construirExcel(filas) {
-  const encabezado = ["N°", "CUIT", "Razón social", "Condición IVA", "Actividad"];
+  const encabezado = ["N°", "CUIT", "Razón social", "Condición IVA", "Actividad principal", "Actividades secundarias", "Domicilio fiscal"];
   const n = filas.length + 1;
-  let xmlFilas = `<row r="1">${encabezado.map((h, i) => celdaTexto("ABCDE"[i] + "1", h, 1)).join("")}</row>`;
+  let xmlFilas = `<row r="1">${encabezado.map((h, i) => celdaTexto("ABCDEFG"[i] + "1", h, 1)).join("")}</row>`;
   filas.forEach((f, i) => {
     const r = i + 2;
+    const [principal, ...secundarias] = actividades(f);
     xmlFilas += `<row r="${r}"><c r="A${r}"><v>${i + 1}</v></c>` + celdaTexto("B" + r, f.cuit, 2) +
-      celdaTexto("C" + r, f.error ? "ERROR: " + f.error : f.razon) + celdaTexto("D" + r, f.iva) + celdaTexto("E" + r, f.actividad) + "</row>";
+      celdaTexto("C" + r, f.error ? "ERROR: " + f.error : f.razon) + celdaTexto("D" + r, f.iva) + celdaTexto("E" + r, principal || "") + celdaTexto("F" + r, secundarias.join(" | ")) + celdaTexto("G" + r, f.domicilio) + "</row>";
   });
   const x = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
   const archivos = {
     "[Content_Types].xml": x + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
     "_rels/.rels": x + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
-    "xl/workbook.xml": x + `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Consulta CUITs" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'Consulta CUITs'!$A$1:$E$${n}</definedName></definedNames></workbook>`,
+    "xl/workbook.xml": x + `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Consulta CUITs" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'Consulta CUITs'!$A$1:$G$${n}</definedName></definedNames></workbook>`,
     "xl/_rels/workbook.xml.rels": x + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
     "xl/styles.xml": x + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="3"><xf/><xf fontId="1" fillId="2" applyFont="1" applyFill="1"/><xf numFmtId="49" applyNumberFormat="1"/></cellXfs></styleSheet>',
-    "xl/worksheets/sheet1.xml": x + `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:E${n}"/><sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="8" customWidth="1"/><col min="2" max="2" width="13" customWidth="1"/><col min="3" max="3" width="53" customWidth="1"/><col min="4" max="4" width="23" customWidth="1"/><col min="5" max="5" width="60" customWidth="1"/></cols><sheetData>${xmlFilas}</sheetData><autoFilter ref="A1:E${n}"/></worksheet>`
+    "xl/worksheets/sheet1.xml": x + `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:G${n}"/><sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="8" customWidth="1"/><col min="2" max="2" width="13" customWidth="1"/><col min="3" max="3" width="53" customWidth="1"/><col min="4" max="4" width="23" customWidth="1"/><col min="5" max="5" width="50" customWidth="1"/><col min="6" max="6" width="60" customWidth="1"/><col min="7" max="7" width="55" customWidth="1"/></cols><sheetData>${xmlFilas}</sheetData><autoFilter ref="A1:G${n}"/></worksheet>`
   };
   return new Blob([zip(archivos)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
 }
@@ -520,7 +551,7 @@ auth.onAuthStateChanged(user => {
     resetInactivityTimer();
     actualizarContador();
     input.focus();
-    pedirAlServidor("/estado").then(d => avisoVencimiento(d.certificadoVence)).catch(e => {
+    pedirAlServidor("/estado").then(d => { avisoVencimiento(d.certificadoVence); actualizarCupo(d); }).catch(e => {
       if (/403|habilitado/.test(e.message)) mostrarBanner(e.message, "error");
     });
   } else {
