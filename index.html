@@ -7,6 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 
 <style>
@@ -173,6 +174,13 @@
   .tag.mono { background: var(--ok-tint); color: var(--ok); }
   .tag.ex { background: var(--pending-tint); color: var(--pending); }
   .tag.no { background: var(--surface-sunken); color: var(--text-muted); }
+  .sync-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+  .sync-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--pending); }
+  .sync-status.ok .sync-dot { background: var(--ok); }
+  .sync-status.off .sync-dot { background: var(--danger); }
+  .buscar { flex: 1; min-width: 220px; padding: 8px 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-family: inherit; font-size: 13.5px; }
+  .buscar:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  td.meta { white-space: nowrap; font-size: 12px; color: var(--text-muted); }
   footer.note { margin-top: 34px; color: var(--text-muted); font-size: 12.5px; text-align: center; }
   .empty { padding: 28px; text-align: center; color: var(--text-muted); font-size: 13px; }
 </style>
@@ -211,14 +219,13 @@
       <div>
         <div class="eyebrow">Estudio Contable Z&amp;V</div>
         <h1>CONSULTA DE CUITS</h1>
-        <p class="subtitle">Datos del padrón de ARCA: razón social, condición frente al IVA y actividades.</p>
+        <div class="sync-status" id="syncStatus"><span class="sync-dot"></span><span id="syncStatusText">Conectando…</span></div>
       </div>
     </div>
   </header>
 
   <section class="panel">
-    <h3>CUITs a consultar</h3>
-    <p class="hint">Pegá los CUITs, uno por línea, con o sin guiones. Podés copiarlos directamente de una columna de Excel.</p>
+    <h3 style="margin-bottom:12px;">CUITs a consultar</h3>
     <textarea id="cuitsInput" placeholder="30-71685590-9&#10;30717208710&#10;…" spellcheck="false"></textarea>
     <div class="actions">
       <button class="btn primary" id="consultarBtn" disabled>Consultar</button>
@@ -245,6 +252,23 @@
     </div>
   </section>
 
+  <section class="panel">
+    <div class="actions" style="margin: 0 0 12px; justify-content: space-between;">
+      <h3 style="margin:0;">CUITs consultados por el equipo</h3>
+      <button class="btn primary" id="equipoExcelBtn" disabled>Descargar Excel</button>
+    </div>
+    <div class="actions" style="margin: 0 0 12px;">
+      <input type="search" class="buscar" id="equipoBuscar" placeholder="Buscar por CUIT, razón social, actividad o domicilio…">
+      <span class="count" id="equipoCount"></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>CUIT</th><th>Razón social</th><th>Condición IVA</th><th>Actividad principal</th><th>Actividades secundarias</th><th>Domicilio fiscal</th><th>Consultado</th></tr></thead>
+        <tbody id="equipoBody"><tr><td colspan="7" class="empty">Cargando…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
   <footer class="note">Estudio Contable Z&amp;V</footer>
 </div>
 
@@ -266,6 +290,9 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
+const fbDb = firebase.database();
+const FB_NS = "consultaCuits"; // espacio propio de esta herramienta en la base compartida
+const EQUIPO_MAX_FILAS = 300;  // filas visibles en la tabla del equipo (el Excel lleva todas)
 
 // --- CUITs ---
 function cuitValido(c) {
@@ -353,6 +380,7 @@ $("consultarBtn").addEventListener("click", async () => {
       const lote = aConsultar.slice(i, i + LOTE);
       const data = await pedirAlServidor("/consultar", { cuits: lote.map(r => r.cuit) });
       data.resultados.forEach((res, k) => Object.assign(lote[k], res, { pendiente: false }));
+      guardarEnEquipo(lote);
       avisoVencimiento(data.certificadoVence);
       actualizarCupo(data);
       hechos += lote.length;
@@ -423,6 +451,97 @@ function render() {
     (errores ? `<div class="stat bad">Con error <strong>${errores}</strong></div>` : "");
 }
 
+// --- Base compartida del equipo (Firebase Realtime Database) ---
+let equipo = [];
+let equipoConectado = false;
+
+function setSyncStatus(mode, text) {
+  $("syncStatus").className = "sync-status " + mode;
+  $("syncStatusText").textContent = text;
+}
+
+// Guarda (o actualiza) cada CUIT consultado con éxito, con fecha y usuario.
+function guardarEnEquipo(filas) {
+  const email = (auth.currentUser && auth.currentUser.email) || "";
+  const cambios = {};
+  filas.filter(f => !f.error && f.razon).forEach(f => {
+    cambios[`${FB_NS}/cuits/${f.cuit}`] = {
+      cuit: f.cuit, razon: f.razon, iva: f.iva || "", actividad: f.actividad || "", domicilio: f.domicilio || "",
+      consultadoEl: firebase.database.ServerValue.TIMESTAMP, consultadoPor: email
+    };
+  });
+  if (!Object.keys(cambios).length) return;
+  fbDb.ref().update(cambios).catch(e => mostrarBanner("Los resultados no se pudieron guardar en la base del equipo: " + e.message, "error"));
+}
+
+function conectarEquipo() {
+  if (equipoConectado) return;
+  equipoConectado = true;
+  fbDb.ref(".info/connected").on("value", snap => {
+    if (snap.val() === true) setSyncStatus("ok", "Sincronizado en la nube");
+    else setSyncStatus("", "Conectando…");
+  });
+  fbDb.ref(`${FB_NS}/cuits`).on("value", snap => {
+    equipo = Object.values(snap.val() || {}).sort((a, b) => (b.consultadoEl || 0) - (a.consultadoEl || 0));
+    renderEquipo();
+  }, err => {
+    setSyncStatus("off", "Sin acceso a la base del equipo");
+    $("equipoBody").innerHTML = `<tr><td colspan="7" class="empty">No se pudo leer la base del equipo: ${esc(err.message)}</td></tr>`;
+  });
+}
+
+function desconectarEquipo() {
+  if (!equipoConectado) return;
+  equipoConectado = false;
+  fbDb.ref(".info/connected").off();
+  fbDb.ref(`${FB_NS}/cuits`).off();
+  equipo = [];
+}
+
+function normalizar(s) { return String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
+
+function equipoFiltrado() {
+  const q = normalizar($("equipoBuscar").value.trim());
+  if (!q) return equipo;
+  const digitos = q.replace(/\D/g, "");
+  return equipo.filter(r =>
+    (digitos.length >= 3 && r.cuit.includes(digitos)) ||
+    normalizar([r.razon, r.iva, r.actividad, r.domicilio, r.consultadoPor].join(" ")).includes(q));
+}
+
+function fechaHora(ms) {
+  if (!ms) return "";
+  const d = new Date(ms), p = x => String(x).padStart(2, "0");
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderEquipo() {
+  const filas = equipoFiltrado();
+  const visibles = filas.slice(0, EQUIPO_MAX_FILAS);
+  $("equipoExcelBtn").disabled = !filas.length;
+  const total = equipo.length;
+  $("equipoCount").innerHTML = !total ? "" :
+    (filas.length === total ? `<strong>${total}</strong> CUIT${total === 1 ? "" : "s"} guardado${total === 1 ? "" : "s"}` : `<strong>${filas.length}</strong> de ${total} coinciden`) +
+    (filas.length > visibles.length ? ` · se muestran los ${EQUIPO_MAX_FILAS} más recientes (el Excel incluye todos)` : "");
+  if (!visibles.length) {
+    $("equipoBody").innerHTML = `<tr><td colspan="7" class="empty">${total ? "Ningún CUIT coincide con la búsqueda." : "Todavía no hay CUITs guardados. Aparecen acá al consultarlos."}</td></tr>`;
+    return;
+  }
+  $("equipoBody").innerHTML = visibles.map(r => {
+    const [principal, ...secundarias] = actividades(r);
+    const quien = (r.consultadoPor || "").split("@")[0];
+    return `<tr><td class="cuit">${formatoCuit(r.cuit)}</td><td class="razon">${esc(r.razon)}</td><td>${tagIva(r.iva)}</td>` +
+      `<td class="act1">${esc(principal || "")}</td><td class="act">${secundarias.map(a => `<span>${esc(a)}</span>`).join("")}</td>` +
+      `<td class="dom">${esc(r.domicilio)}</td><td class="meta">${fechaHora(r.consultadoEl)}<br>${esc(quien)}</td></tr>`;
+  }).join("");
+}
+
+$("equipoBuscar").addEventListener("input", renderEquipo);
+$("equipoExcelBtn").addEventListener("click", () => {
+  const filas = equipoFiltrado();
+  if (filas.length) descargarExcel(construirExcel(filas, true), "consulta_cuits_equipo");
+});
+
 // --- Excel (.xlsx) ---
 function xmlEsc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
@@ -431,24 +550,28 @@ function xmlEsc(s) {
 function celdaTexto(ref, v, s) {
   return `<c r="${ref}" t="inlineStr"${s ? ` s="${s}"` : ""}><is><t xml:space="preserve">${xmlEsc(v)}</t></is></c>`;
 }
-function construirExcel(filas) {
-  const encabezado = ["N°", "CUIT", "Razón social", "Condición IVA", "Actividad principal", "Actividades secundarias", "Domicilio fiscal"];
+// conConsulta agrega las columnas "Consultado el" y "Consultado por" (base del equipo).
+function construirExcel(filas, conConsulta) {
+  const encabezado = ["N°", "CUIT", "Razón social", "Condición IVA", "Actividad principal", "Actividades secundarias", "Domicilio fiscal"]
+    .concat(conConsulta ? ["Consultado el", "Consultado por"] : []);
+  const ultima = "ABCDEFGHI"[encabezado.length - 1];
   const n = filas.length + 1;
-  let xmlFilas = `<row r="1">${encabezado.map((h, i) => celdaTexto("ABCDEFG"[i] + "1", h, 1)).join("")}</row>`;
+  let xmlFilas = `<row r="1">${encabezado.map((h, i) => celdaTexto("ABCDEFGHI"[i] + "1", h, 1)).join("")}</row>`;
   filas.forEach((f, i) => {
     const r = i + 2;
     const [principal, ...secundarias] = actividades(f);
     xmlFilas += `<row r="${r}"><c r="A${r}"><v>${i + 1}</v></c>` + celdaTexto("B" + r, f.cuit, 2) +
-      celdaTexto("C" + r, f.error ? "ERROR: " + f.error : f.razon) + celdaTexto("D" + r, f.iva) + celdaTexto("E" + r, principal || "") + celdaTexto("F" + r, secundarias.join(" | ")) + celdaTexto("G" + r, f.domicilio) + "</row>";
+      celdaTexto("C" + r, f.error ? "ERROR: " + f.error : f.razon) + celdaTexto("D" + r, f.iva) + celdaTexto("E" + r, principal || "") + celdaTexto("F" + r, secundarias.join(" | ")) + celdaTexto("G" + r, f.domicilio) +
+      (conConsulta ? celdaTexto("H" + r, fechaHora(f.consultadoEl)) + celdaTexto("I" + r, f.consultadoPor) : "") + "</row>";
   });
   const x = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
   const archivos = {
     "[Content_Types].xml": x + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
     "_rels/.rels": x + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
-    "xl/workbook.xml": x + `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Consulta CUITs" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'Consulta CUITs'!$A$1:$G$${n}</definedName></definedNames></workbook>`,
+    "xl/workbook.xml": x + `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Consulta CUITs" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'Consulta CUITs'!$A$1:$${ultima}$${n}</definedName></definedNames></workbook>`,
     "xl/_rels/workbook.xml.rels": x + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
     "xl/styles.xml": x + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="3"><xf/><xf fontId="1" fillId="2" applyFont="1" applyFill="1"/><xf numFmtId="49" applyNumberFormat="1"/></cellXfs></styleSheet>',
-    "xl/worksheets/sheet1.xml": x + `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:G${n}"/><sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="8" customWidth="1"/><col min="2" max="2" width="13" customWidth="1"/><col min="3" max="3" width="53" customWidth="1"/><col min="4" max="4" width="23" customWidth="1"/><col min="5" max="5" width="50" customWidth="1"/><col min="6" max="6" width="60" customWidth="1"/><col min="7" max="7" width="55" customWidth="1"/></cols><sheetData>${xmlFilas}</sheetData><autoFilter ref="A1:G${n}"/></worksheet>`
+    "xl/worksheets/sheet1.xml": x + `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:${ultima}${n}"/><sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="8" customWidth="1"/><col min="2" max="2" width="13" customWidth="1"/><col min="3" max="3" width="53" customWidth="1"/><col min="4" max="4" width="23" customWidth="1"/><col min="5" max="5" width="50" customWidth="1"/><col min="6" max="6" width="60" customWidth="1"/><col min="7" max="7" width="55" customWidth="1"/><col min="8" max="8" width="17" customWidth="1"/><col min="9" max="9" width="30" customWidth="1"/></cols><sheetData>${xmlFilas}</sheetData><autoFilter ref="A1:${ultima}${n}"/></worksheet>`
   };
   return new Blob([zip(archivos)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
 }
@@ -487,15 +610,18 @@ function zip(archivos) {
   return new Blob([...partes, ...central, fin]);
 }
 
-$("excelBtn").addEventListener("click", () => {
-  if (!resultados.length) return;
+function descargarExcel(blob, prefijo) {
   const d = new Date(), p = x => String(x).padStart(2, "0");
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(construirExcel(resultados));
-  a.download = `consulta_cuits_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}.xlsx`;
+  a.href = URL.createObjectURL(blob);
+  a.download = `${prefijo}_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}.xlsx`;
   document.body.appendChild(a);
   a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+}
+
+$("excelBtn").addEventListener("click", () => {
+  if (resultados.length) descargarExcel(construirExcel(resultados), "consulta_cuits");
 });
 
 // --- Sesión (igual que las otras herramientas) ---
@@ -550,12 +676,14 @@ auth.onAuthStateChanged(user => {
     $("appRoot").style.display = "";
     resetInactivityTimer();
     actualizarContador();
+    conectarEquipo();
     input.focus();
     pedirAlServidor("/estado").then(d => { avisoVencimiento(d.certificadoVence); actualizarCupo(d); }).catch(e => {
       if (/403|habilitado/.test(e.message)) mostrarBanner(e.message, "error");
     });
   } else {
     clearTimeout(inactivityTimer);
+    desconectarEquipo();
     $("loginGate").style.display = "flex";
     $("appRoot").style.display = "none";
     if (loggedOutByInactivity) {
